@@ -19,5 +19,5 @@ Add a section similar to the following to the services.cfg file:
 
 # Output
 ```
-VIOS SEA OK - Shared Ethernet Adapter state is normal
+VIOS SEA OK - Shared Ethernet Adapter state is normal, ent8 priority=1 active=True largesend=1 large_receive=yes health_time=60 health_status:HEALTHY
 ```
