@@ -1,0 +1,362 @@
+#!/usr/bin/perl -w
+
+#
+#  Nagios plugin for determining status of Shared Ethernet Adapter (SEA) on IBM VIOS
+#
+
+# OUTSTANDING TASKS
+# -----------------
+
+
+
+
+# CHANGE LOG
+# ----------
+#   2014-01-17  njeffrey@anisoftgroup.com	Script created
+#   2014-05-09  njeffrey@anisoftgroup.com	Confirm largesend is enabled on SEA
+#   2017-10-24  njeffrey@anisoftgroup.com	Add get_sea_health_time   subroutine
+#   2017-10-24  njeffrey@anisoftgroup.com	Add get_sea_health_status subroutine
+
+
+
+
+# NOTES
+# -----
+#  This script should return one (and only one) line of ouput.  Multiple
+#  lines of output are silently ignored by nagios.
+#
+#  The line of output will become the body of the alert message sent by nagios
+#
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.  You will need to add a section similar to the following
+#  to the services.cfg file on the nagios server.  Please note that this example assumes
+#  you are using the check_by_ssh method for remotely executing nagios checks.  This assumes
+#  that you already have ssh key pairs configured.
+#      define service {
+#              use                             generic-24x7-service
+#              hostgroup_name                  all_vio
+#              service_description             VIOS SEA
+#              check_command                   check_by_ssh!/usr/local/nagios/libexec/check_vios_sea
+#              }
+
+
+use diagnostics;                                #tell the perl interpreter to give us verbose messages while debugging
+use strict;                                     #enforce good coding practices
+
+
+
+
+
+# define variables
+my (%sea,$ioscli,$lsdev,,$lsattr,$entstat,$key,$count,$message);
+my ($verbose,$largesend_enable);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);				#define variables
+$ioscli              = "/usr/ios/cli/ioscli";				#variable to hold location of ioscli binary
+$lsdev               = "/usr/sbin/lsdev";				#variable to hold location of lsdev binary
+$lsattr              = "/usr/sbin/lsattr";				#variable to hold location of lsattr binary
+$entstat             = "/usr/bin/entstat";				#variable to hold location of entstat binary
+$verbose             = "no";						#yes/no flag for verbose output for debugging
+$count               = 0;						#initialize counter variable
+$largesend_enable    = "yes";						#yes for VIOS/AIX environments, no for VIOS/Linux/i5os environments
+$CHECK_NAME= "VIOS SEA";						#define name of nagios check
+#
+# Nagios return codes
+#
+$OK=            0;                              			#this script returns a value to nagios for processing
+$WARN=          1;                              			#this script returns a value to nagios for processing
+$CRITICAL=      2;                              			#this script returns a value to nagios for processing
+$UNKNOWN=       3;                              			#this script returns a value to nagios for processing
+
+
+
+
+
+
+sub sanity_checks {
+   #
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm this machine is a VIOS server
+   if ( ! -e $ioscli ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $ioscli binary. This machine is not a VIOS server. \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $ioscli ) {
+      print "$CHECK_NAME CRITICAL - $ioscli binary is not executable by the current user.\n";
+      exit $CRITICAL;
+   }
+   # confirm required binary exists
+   if ( ! -e $lsdev ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsdev binary. \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $lsdev ) {
+      print "$CHECK_NAME CRITICAL - $lsdev binary is not executable by the current user.\n";
+      exit $CRITICAL;
+   }
+   # confirm required binary exists
+   if ( ! -e $lsattr ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $lsattr binary. \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $lsattr ) {
+      print "$CHECK_NAME CRITICAL - $lsattr binary is not executable by the current user.\n";
+      exit $CRITICAL;
+   }
+   # confirm required binary exists
+   if ( ! -e $entstat ) {
+      print "$CHECK_NAME CRITICAL - Cannot find $entstat binary. \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $entstat ) {
+      print "$CHECK_NAME CRITICAL - $entstat binary is not executable by the current user.\n";
+      exit $CRITICAL;
+   }
+}		 							#end of subroutine
+
+
+
+
+sub get_sea_names {
+   #
+   # This subroutine looks at all the AIX devices to figure out the names of the Shared Ethernet Adapters
+   # Example:
+   #  lsdev
+   #  ent8            Available             Shared Ethernet Adapter
+   #
+   #
+   print "running get_sea_names subroutine \n" if ($verbose eq "yes");
+   #
+   # Figure out where the SEA devices are
+   open(IN,"$lsdev|");      						#open filehandle using command output
+   while (<IN>) {                                      		    	#read a line from filehandle
+      if ( /^(ent[0-9]+) +([a-zA-z]+) +Shared Ethernet Adapter/) {	#find the Shared Ethernet Adapter(s)
+         $sea{$1}{name}  = $1;						#assign device name to hash  (ent##)
+         $sea{$1}{state} = $2;						#assign device state to hash (Available, Defined)
+         print "   found Shared Ethernet Adapter $sea{$1}{name} \n" if ($verbose eq "yes");
+      }									#end of if block
+   }									#end of while loop
+   close IN;								#close filehandle
+   #
+   # Make sure that we found at least one SEA
+   $count = scalar keys %sea;						#count the number of keys in the hash
+   if ( $count == 0 ) {
+      print "$CHECK_NAME UNKNOWN - there are no Shared Ethernet Adapters on this system \n";
+      exit $UNKNOWN;
+   }									#end of if block
+} 									#end of subroutine
+
+
+
+
+
+sub get_sea_priority {
+   #
+   # This subroutine runs the "entstat -d" command against each Shared Ethernet Adapter
+   # to figure out the priority and the active state.
+   #
+   print "running get_sea_priority subroutine \n" if ($verbose eq "yes");
+   #
+   # Each SEA will have a priority of 1 or 2  (1 is the primary, 2 is the standby)
+   #
+   foreach $key (sort keys %sea) {  		     			#loop through for each SEA
+      next unless $key;                        		  		#skip any blank lines
+      print "   checking SEA $key \n" if ($verbose eq "yes");
+      open(IN,"$entstat -d $key 2>&1|");      				#open filehandle using command output
+      while (<IN>) {                                   		    	#read a line from filehandle
+         if ( /Priority: ([1-2]) +Active: ([a-zA-Z]+)/) {		#find the line in the entstat output that shows SEA priority
+            $sea{$key}{priority}  = $1;					#assign value to hash  (1,2)
+            $sea{$key}{active}    = $2;					#assign value to hash (True,False)
+            print "   found SEA=$sea{$key}{name} Priority=$sea{$key}{priority} Active=$sea{$key}{active} \n" if ($verbose eq "yes");
+         }								#end of if block
+      }									#end of while block
+      close IN;								#close filehandle
+   }									#end of foreach loop
+}	  	                                                     	#end of subroutine
+
+
+sub get_largesend_status {
+   #
+   print "running get_largesend_status subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %sea) {  		     			#loop through for each SEA
+      next unless $key;                        		  		#skip any blank lines
+      #
+      # VIOS versions older than 2.2.2.0 do not support largesend or large_receive.
+      # Start out with dummy values that will get overwritten if the VIOS supports these features.
+      $sea{$key}{largesend}     = "unknown";
+      $sea{$key}{large_receive} = "unknown";
+      #
+      print "   checking SEA $key \n" if ($verbose eq "yes");
+      open(IN,"$lsattr -El $key 2>&1|");      				#open filehandle using command output
+      while (<IN>) {                                   	    		#read a line from filehandle
+         if ( /^largesend +([0-9]+)/) {					#find the line in the lsattr output that shows largesend setting
+            $sea{$key}{largesend}  = $1;				#assign value to hash  (0,1)
+            print "   found SEA=$sea{$key}{name} largesend=$sea{$key}{largesend} \n" if ($verbose eq "yes");
+         }								#end of if block
+         if ( /^large_receive +([a-zA-Z]+)/) {				#find the line in the lsattr output that shows large_receive setting
+            $sea{$key}{large_receive}  = $1;				#assign value to hash  (yes,no)
+            print "   found SEA=$sea{$key}{name} large_receive=$sea{$key}{large_receive} \n" if ($verbose eq "yes");
+         }								#end of if block
+      }									#end of while block
+      close IN;								#close filehandle
+   }									#end of foreach loop
+}	  	                                                     	#end of subroutine
+
+
+sub get_sea_health_time {
+   #
+   print "running get_sea_health_time subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %sea) {  		     			#loop through for each SEA
+      next unless $key;                        		  		#skip any blank lines
+      #
+      # VIOS versions older than 2.2.5.0 do not have the health_time attribute on the SEA
+      # Start out with dummy values that will get overwritten if the VIOS supports these features.
+      $sea{$key}{health_time}     = "unknown";
+      #
+      print "   checking SEA $key \n" if ($verbose eq "yes");
+      open(IN,"$lsattr -El $key 2>&1|");      				#open filehandle using command output
+      while (<IN>) {                                   	    		#read a line from filehandle
+         if ( /^health_time +([0-9]+)/) {				#find the line in the lsattr output that shows health_time setting
+            $sea{$key}{health_time}  = $1;				#assign value to hash 
+            print "   found SEA=$sea{$key}{name} health_time=$sea{$key}{health_time} \n" if ($verbose eq "yes");
+         }								#end of if block
+      }									#end of while block
+      close IN;								#close filehandle
+   }									#end of foreach loop
+}	  	                                                     	#end of subroutine
+
+
+
+sub get_sea_health_status {
+   #
+   print "running get_sea_health_status subroutine \n" if ($verbose eq "yes");
+   #
+   foreach $key (sort keys %sea) {  		     			#loop through for each SEA
+      next unless $key;                        		  		#skip any blank lines
+      #
+      # VIOS versions older than 2.2.5.0 do not have the UNHEALTHY status
+      # Start out with dummy values that will get overwritten if the VIOS supports these features.
+      $sea{$key}{health_status}     = "unknown";
+      #
+      print "   checking SEA $key \n" if ($verbose eq "yes");
+      open(IN,"$entstat -d $key 2>&1|");      				#open filehandle using command output
+      while (<IN>) {                                   	    		#read a line from filehandle
+         if ( /^    State: +([A-Z]+)/) {				#find the line in the entstat output that shows State: PRIMARY|BACKUP|UNHEALTHY
+            $sea{$key}{health_status}  = $1;				#assign value to hash 
+            print "   found SEA=$sea{$key}{name} health_status=$sea{$key}{health_status} \n" if ($verbose eq "yes");
+         }								#end of if block
+         #
+         # The state of the SEA will be one of:  PRIMARY BACKUP UNHEALTHY
+         # Since the PRIMARY and BACKUP states are good, let's call them HEALTHY
+         $sea{$key}{health_status}="HEALTHY" if ($sea{$key}{health_status} eq "PRIMARY");
+         $sea{$key}{health_status}="HEALTHY" if ($sea{$key}{health_status} eq "BACKUP");
+      }									#end of while block
+      close IN;								#close filehandle
+   }									#end of foreach loop
+}	  	                                                     	#end of subroutine
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   #
+   $message = ",";							#put a comma into the variable to separate the details of each SEA
+   foreach $key (sort keys %sea) {     			  		#loop through for each SEA
+      next unless $key;							#skip any blanks
+      #
+      #get all the hash values into a single scalar variable to make output simpler
+      $message = "$message $sea{$key}{name} priority=$sea{$key}{priority} active=$sea{$key}{active} largesend=$sea{$key}{largesend} large_receive=$sea{$key}{large_receive} health_time=$sea{$key}{health_time} health_status:$sea{$key}{health_status}";
+   }									#end of foreach block
+   #
+   #
+   # Look for any SEA where the priority=1 is not the active SEA
+   foreach $key (sort keys %sea) {     			  		#loop through for each SEA
+      next unless $key;							#skip any blanks
+      if ( $sea{$key}{priority} == 1 ) {				#look for priority=1 and confirm it is the active SEA
+         if ( $sea{$key}{active} eq "False" ) {				#this hash value should the "True"
+            print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} has priority $sea{$key}{priority}, but is not currently the active SEA.  There may be a problem with this VIOS server.  $message \n";
+            exit $WARN;
+         }								#end of if block
+      }									#end of if block
+      if ( $sea{$key}{priority} == 2 ) {				#look for priority=2 and confirm it is the standby SEA
+         if ( $sea{$key}{active} eq "True" ) {				#this hash value should the "False"
+            print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} has priority $sea{$key}{priority}, but is currently the active SEA.  The higher priority SEA may have failed.  $message \n";
+            exit $WARN;
+         }								#end of if block
+      }									#end of if block
+   }									#end of foreach block
+   #
+   #
+   # Look for largesend and large_receive attributes
+   if ( $largesend_enable eq "yes" ) {					#only run this section in pure AIX environments - Linux and i5/OS do not support largesend
+      foreach $key (sort keys %sea) {   		  		#loop through for each SEA
+         next unless $key;						#skip any blanks
+         next if ( $sea{$key}{largesend}     eq "unknown" );		#VIOS versions older than 2.2.2.0 do not support largesend
+         next if ( $sea{$key}{large_receive} eq "unknown" );		#VIOS versions older than 2.2.2.0 do not support large_receive
+         #
+         if ( $sea{$key}{largesend} == 0 ) {				#0=disabled 1=enabled
+            print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} does not have largesend enabled.      To improve network throughput, please enable with this command: chdev -dev $sea{$key}{name} -attr largesend=1 \n";
+            exit $WARN;
+         }								#end of unless block
+         #
+         if ( $sea{$key}{large_receive} eq "no" ) {			#no=disabled yes=enabled
+            print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} does not have large_receive enabled.  To improve network throughput, please enable with this command: chdev -dev $sea{$key}{name} -attr large_receive=yes \n";
+            exit $WARN;
+         }								#end of unless block
+      }									#end of foreach block
+   } 									#end of if block
+   #
+   #
+   # Look for health_time attribute
+   foreach $key (sort keys %sea) {   		  			#loop through for each SEA
+      next unless $key;							#skip any blanks
+      next if ( $sea{$key}{health_time} eq "unknown" );			#VIOS versions older than 2.2.5.0 do not have the health_time attribute
+      #
+      if ( ($sea{$key}{health_time} < 1) || ($sea{$key}{health_time} > 60) ){	
+         print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} has a health_time attribute of $sea{$key}{health_time}.  To ensure rapid recovery after VIOS reboots or ethernet link failures, this value should be between 1 and 60 seconds.  Please set with these commands: chdev -dev $sea{$key}{name} -attr health_time=60 , chdev -dev $sea{$key}{name} -attr health_time=60 -perm \n";
+         exit $WARN;
+      }								#end of unless block
+   } 									#end of if block
+   #
+   #
+   # Look for a state of UNHEALTHY on the SEA
+   # The UNHEALTHY attribute only exists on VIOS 2.2.5.0 and later
+   foreach $key (sort keys %sea) {   		  			#loop through for each SEA
+      next unless $key;							#skip any blanks
+      next if ( $sea{$key}{health_status} eq "unknown" );		#VIOS versions older than 2.2.5.0 do not have the health_time attribute
+      next if ( $sea{$key}{health_status} eq "HEALTHY" );		#skip if the SEA is in a HEALTHY state
+      #
+      if ( $sea{$key}{health_status} eq "UNHEALTHY" ){		
+         print "$CHECK_NAME WARN - Shared Ethernet Adapter $sea{$key}{name} has a state of UNHEALTHY. Please investigate with entstat -d $sea{$key}{name} \n";
+         exit $WARN;
+      }								#end of unless block
+   } 									#end of if block
+   #
+   #
+   # If we get this far, everything should be ok
+   print "$CHECK_NAME OK - Shared Ethernet Adapter state is normal  $message  \n";
+   exit $OK;
+}                                                       #end of subroutine
+
+
+
+
+
+
+
+
+# --------------- main body of program ------------------------------------
+sanity_checks;
+get_sea_names;
+get_sea_priority;
+get_largesend_status;
+get_sea_health_time;
+get_sea_health_status;
+print_output;
