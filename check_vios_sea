@@ -12,10 +12,10 @@
 
 # CHANGE LOG
 # ----------
-#   2014-01-17  njeffrey@anisoftgroup.com	Script created
-#   2014-05-09  njeffrey@anisoftgroup.com	Confirm largesend is enabled on SEA
-#   2017-10-24  njeffrey@anisoftgroup.com	Add get_sea_health_time   subroutine
-#   2017-10-24  njeffrey@anisoftgroup.com	Add get_sea_health_status subroutine
+#   2014-01-17  njeffrey	Script created
+#   2014-05-09  njeffrey	Confirm largesend is enabled on SEA
+#   2017-10-24  njeffrey	Add get_sea_health_time   subroutine
+#   2017-10-24  njeffrey	Add get_sea_health_status subroutine
 
 
 
